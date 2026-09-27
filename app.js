@@ -186,18 +186,35 @@ menuBtn.addEventListener("click", () => {
 });
 backdrop.addEventListener("click", closeSidebarMobile);
 
-input.addEventListener("input", () => {
+// Close the mobile drawer when the layout becomes desktop, so its backdrop can
+// never stay stuck over the app after a rotation or resize.
+const desktopQuery = window.matchMedia("(min-width: 821px)");
+function syncLayout() { if (desktopQuery.matches) closeSidebarMobile(); }
+if (desktopQuery.addEventListener) desktopQuery.addEventListener("change", syncLayout);
+else if (desktopQuery.addListener) desktopQuery.addListener(syncLayout);
+window.addEventListener("orientationchange", () => setTimeout(syncLayout, 120));
+syncLayout();
+
+// Touch keyboards send Enter as a newline key; only send on Enter with a real keyboard.
+const isTouch = window.matchMedia("(hover: none) and (pointer: coarse)").matches;
+
+function autosize() {
   input.style.height = "auto";
   input.style.height = Math.min(input.scrollHeight, 200) + "px";
-});
+}
+input.addEventListener("input", autosize);
 input.addEventListener("keydown", (e) => {
-  if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); form.requestSubmit(); }
+  if (e.key === "Enter" && !e.shiftKey && !isTouch) { e.preventDefault(); form.requestSubmit(); }
 });
-form.addEventListener("submit", (e) => { e.preventDefault(); send(); });
+form.addEventListener("submit", (e) => {
+  e.preventDefault();
+  if (sending) { stopGenerating(); return; }
+  send();
+});
 
 document.addEventListener("click", (e) => {
-  const chip = e.target.closest(".chip");
-  if (chip) { input.value = chip.textContent; input.dispatchEvent(new Event("input")); input.focus(); }
+  const chip = e.target.closest?.(".chip");
+  if (chip) { input.value = chip.textContent.trim(); autosize(); input.focus(); }
 });
 
 // ---------- threads ----------
@@ -271,7 +288,7 @@ function renderMessages() {
   messagesEl.innerHTML = "";
   if (!t || !t.messages.length) { messagesEl.innerHTML = emptyStateHtml(); return; }
   for (const m of t.messages) {
-    const node = renderMessage(m.role, m.content, { error: m.error });
+    const node = renderMessage(m.role, m.content, { error: m.error, images: m.images, search: m.search });
     messagesEl.appendChild(node);
     if (m.role === "assistant" && m.error) attachRetryButton(node);
   }
@@ -287,6 +304,17 @@ function renderMessage(role, content, opts = {}) {
   const bubble = wrap.querySelector(".bubble");
   bubble.innerHTML = renderMarkdown(content);
   enhanceBubble(bubble, content);
+  if (opts.images && opts.images.length) {
+    const g = document.createElement("div");
+    g.className = "msg-images";
+    for (const src of opts.images) { const im = document.createElement("img"); im.src = src; im.alt = "Attached image"; g.appendChild(im); }
+    bubble.prepend(g);
+  }
+  if (opts.search) {
+    const b = document.createElement("div");
+    b.className = "search-badge"; b.textContent = "🌐 Web search";
+    bubble.prepend(b);
+  }
   return wrap;
 }
 
@@ -365,16 +393,86 @@ function attachRetryButton(msgNode) {
 }
 
 function scrollToBottom() { messagesEl.scrollTop = messagesEl.scrollHeight; }
+function nearBottom() {
+  return messagesEl.scrollHeight - messagesEl.scrollTop - messagesEl.clientHeight < 140;
+}
+// Only auto-follow the stream while the reader is parked at the bottom.
+let autoFollow = true;
+messagesEl.addEventListener("scroll", () => { autoFollow = nearBottom(); }, { passive: true });
 
 // ---------- sending ----------
+// ---------- attachments + web search ----------
+const fileInput = document.getElementById("fileInput");
+const attachBtn = document.getElementById("attachBtn");
+const searchBtn = document.getElementById("searchBtn");
+const attachRow = document.getElementById("attachRow");
+let pending = []; // { kind: "image"|"text", name, data }
+let searchOn = false;
+
+searchBtn.addEventListener("click", () => {
+  searchOn = !searchOn;
+  searchBtn.setAttribute("aria-pressed", String(searchOn));
+  toast(searchOn ? "Web search on for next messages" : "Web search off");
+});
+attachBtn.addEventListener("click", () => fileInput.click());
+fileInput.addEventListener("change", async () => {
+  for (const f of [...fileInput.files]) {
+    if (pending.length >= 4) { toast("Up to 4 files per message."); break; }
+    try {
+      if (f.type.startsWith("image/")) pending.push({ kind: "image", name: f.name, data: await compressImage(f) });
+      else if (f.size > 200000) toast(`${f.name} is too large (max 200 KB).`);
+      else pending.push({ kind: "text", name: f.name, data: await f.text() });
+    } catch { toast(`Couldn't read ${f.name}.`); }
+  }
+  fileInput.value = "";
+  renderAttachments();
+});
+function renderAttachments() {
+  attachRow.innerHTML = "";
+  pending.forEach((p, i) => {
+    const chip = document.createElement("div");
+    chip.className = "attach-chip";
+    chip.innerHTML = (p.kind === "image" ? `<img alt="" src="${p.data}">` : "📄") + `<span></span><button type="button" aria-label="Remove ${escapeAttr(p.name)}">×</button>`;
+    chip.querySelector("span").textContent = p.name;
+    chip.querySelector("button").onclick = () => { pending.splice(i, 1); renderAttachments(); };
+    attachRow.appendChild(chip);
+  });
+}
+function escapeAttr(s) { return String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c])); }
+function compressImage(file) {
+  return new Promise((resolve, reject) => {
+    const url = URL.createObjectURL(file);
+    const img = new Image();
+    img.onload = () => {
+      const max = 1280;
+      const s = Math.min(1, max / Math.max(img.width, img.height));
+      const c = document.createElement("canvas");
+      c.width = Math.round(img.width * s); c.height = Math.round(img.height * s);
+      c.getContext("2d").drawImage(img, 0, 0, c.width, c.height);
+      URL.revokeObjectURL(url);
+      resolve(c.toDataURL("image/jpeg", 0.82));
+    };
+    img.onerror = () => { URL.revokeObjectURL(url); reject(new Error("bad image")); };
+    img.src = url;
+  });
+}
+
 async function send() {
-  const text = input.value.trim();
-  if (!text || sending) return;
+  let text = input.value.trim();
+  if ((!text && !pending.length) || sending) return;
 
   if (!currentThread()) newThread();
   const t = currentThread();
 
-  t.messages.push({ role: "user", content: text });
+  const images = pending.filter((p) => p.kind === "image").map((p) => p.data);
+  const texts = pending.filter((p) => p.kind === "text");
+  for (const f of texts) text += `\n\n**Attached file: ${f.name}**\n\`\`\`\n${f.data}\n\`\`\``;
+  if (!text && images.length) text = "Describe this image.";
+  const msg = { role: "user", content: text };
+  if (images.length) msg.images = images;
+  if (searchOn) msg.search = true;
+  t.messages.push(msg);
+  pending = []; renderAttachments();
   if (t.title === "New chat") t.title = text.slice(0, 40) + (text.length > 40 ? "…" : "");
   t.updatedAt = Date.now();
   await persist();
@@ -435,36 +533,75 @@ function backoffDelay(attempt) {
   return settings.backoffMs * attempt;
 }
 
+const SEND_ICON = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><line x1="5" y1="12" x2="19" y2="12"/><polyline points="12 5 19 12 12 19"/></svg>';
+const STOP_ICON = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round" aria-hidden="true" focusable="false"><rect x="6" y="6" width="12" height="12" rx="2"/></svg>';
+
+let controller = null;
+
+function stopGenerating() { try { controller?.abort(); } catch {} }
+
+function setSendingUI(active) {
+  sendBtn.classList.toggle("stop", active);
+  sendBtn.innerHTML = active ? STOP_ICON : SEND_ICON;
+  sendBtn.setAttribute("aria-label", active ? "Stop generating" : "Send");
+  sendBtn.title = active ? "Stop generating" : "Send";
+  if (active) sendBtn.setAttribute("aria-busy", "true");
+  else sendBtn.removeAttribute("aria-busy");
+}
+
+// Keeps a partially streamed code fence from rendering as raw backticks.
+function renderStreaming(text) {
+  const fences = (text.match(/```/g) || []).length;
+  return renderMarkdown(fences % 2 ? text + "\n```" : text);
+}
+
+const THINKING_HTML = (label) =>
+  `<div class="typing" role="status"><span class="typing-dots" aria-hidden="true"><span></span><span></span><span></span></span><span class="typing-label">${label}</span></div>`;
+
 async function streamReply() {
   const t = currentThread();
   if (!t) return;
-  sending = true; sendBtn.disabled = true; sendBtn.setAttribute("aria-busy", "true");
+  sending = true;
+  setSendingUI(true);
 
   const assistantMsg = { role: "assistant", content: "" };
   t.messages.push(assistantMsg);
   const node = renderMessage("assistant", "");
   const bubbleContent = node.querySelector(".bubble");
-  bubbleContent.innerHTML = `<div class="typing" role="status"><span class="typing-dots" aria-hidden="true"><span></span><span></span><span></span></span><span class="typing-label">Waguri is thinking…</span></div>`;
+  bubbleContent.innerHTML = THINKING_HTML("Waguri is thinking…");
   const empty = messagesEl.querySelector(".empty-state"); if (empty) empty.remove();
   messagesEl.appendChild(node);
   scrollToBottom();
 
-  const history = t.messages
+  const clean = t.messages
     .slice(0, -1)
-    .filter((m) => !m.error && (m.content || "").trim().length > 0)
-    .map((m) => ({ role: m.role, content: m.content }));
+    .filter((m) => !m.error && ((m.content || "").trim().length > 0 || (m.images && m.images.length)));
+  // Only the 3 most recent image-bearing messages resend their images (keeps requests small).
+  let imgBudget = 3;
+  const history = [];
+  for (let i = clean.length - 1; i >= 0; i--) {
+    const m = clean[i];
+    const out = { role: m.role, content: m.content || "" };
+    if (m.images && m.images.length && imgBudget > 0) { out.images = m.images; imgBudget--; }
+    history.unshift(out);
+  }
+  const lastUser = clean[clean.length - 1];
+  const useSearch = !!(lastUser && lastUser.search);
 
   let lastError = null;
-
+  let stopped = false;
   const maxAttempts = settings.attempts;
 
-  // 24/7 guarantee: client-side retries with backoff on top of server model failover.
+  // Client-side retries with backoff keep replies flowing through transient failures.
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    controller = new AbortController();
     try {
+      if (useSearch) bubbleContent.innerHTML = THINKING_HTML("Searching the web…");
       const res = await fetch(API_URL, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ messages: history, model: settings.model }),
+        body: JSON.stringify({ messages: history, model: settings.model, search: useSearch }),
+        signal: controller.signal,
       });
       if (!res.ok || !res.body) {
         const message = (await res.text()).trim() || `HTTP ${res.status}`;
@@ -474,24 +611,35 @@ async function streamReply() {
       }
 
       const usedModel = res.headers.get("X-Waguri-Model");
-      if (usedModel) setModelStatus(true, MODELS[usedModel] + " active");
-      else setModelStatus(true, "Ready");
+      setModelStatus(true, usedModel ? (MODELS[usedModel] || "Model") + " active" : "Ready");
 
       const reader = res.body.getReader();
       const decoder = new TextDecoder();
       bubbleContent.innerHTML = "";
       let acc = "";
+      autoFollow = true;
       while (true) {
         const { value, done } = await reader.read();
+        acc += decoder.decode(value, { stream: !done });
+        if (acc) {
+          assistantMsg.content = acc;
+          bubbleContent.innerHTML = renderStreaming(acc);
+          if (autoFollow) scrollToBottom();
+          t.updatedAt = Date.now();
+          persistSoon();
+        }
         if (done) break;
-        acc += decoder.decode(value, { stream: true });
-        assistantMsg.content = acc;
-        bubbleContent.innerHTML = renderMarkdown(acc);
-        scrollToBottom();
-        t.updatedAt = Date.now();
-        persistSoon();
       }
+
+      if (!acc.trim()) {
+        const error = new Error("The model returned an empty reply.");
+        error.status = 502;
+        throw error;
+      }
+
+      assistantMsg.content = acc;
       assistantMsg.error = false;
+      bubbleContent.innerHTML = renderMarkdown(acc);
       enhanceBubble(bubbleContent, acc);
       t.updatedAt = Date.now();
       await persist();
@@ -499,18 +647,39 @@ async function streamReply() {
       lastError = null;
       break;
     } catch (err) {
+      if (err && (err.name === "AbortError" || controller?.signal.aborted)) {
+        stopped = true;
+        lastError = null;
+        break;
+      }
       lastError = err;
-      const retryable = lastError.status === 429 || lastError.status >= 500 || !lastError.status;
+      const retryable = err.status === 429 || err.status >= 500 || !err.status;
       if (attempt < maxAttempts && retryable) {
-        const wait = backoffDelay(attempt);
-        bubbleContent.innerHTML = `<div class="typing" role="status"><span class="typing-dots" aria-hidden="true"><span></span><span></span><span></span></span><span class="typing-label">Reconnecting… (attempt ${attempt + 1}/${maxAttempts})</span></div>`;
-        await new Promise((r) => setTimeout(r, wait));
+        bubbleContent.innerHTML = THINKING_HTML(`Reconnecting… (attempt ${attempt + 1}/${maxAttempts})`);
+        await new Promise((r) => setTimeout(r, backoffDelay(attempt)));
       } else break;
     }
   }
 
-  if (lastError) {
-    assistantMsg.content = lastError.message;
+  controller = null;
+
+  if (stopped) {
+    const text = (assistantMsg.content || "").trim();
+    if (text) {
+      assistantMsg.error = false;
+      bubbleContent.innerHTML = renderMarkdown(text);
+      enhanceBubble(bubbleContent, text);
+    } else {
+      t.messages = t.messages.filter((m) => m !== assistantMsg);
+      node.remove();
+      if (!t.messages.length) renderMessages();
+    }
+    setModelStatus(true, "Stopped");
+    t.updatedAt = Date.now();
+    await persist();
+    renderThreads();
+  } else if (lastError) {
+    assistantMsg.content = lastError.message || "The reply could not be completed.";
     assistantMsg.error = true;
     node.classList.add("error");
     bubbleContent.innerHTML = renderMarkdown(assistantMsg.content);
@@ -520,8 +689,10 @@ async function streamReply() {
     await persist();
   }
 
-  sending = false; sendBtn.disabled = false; sendBtn.removeAttribute("aria-busy");
-  input.focus();
+  sending = false;
+  sendBtn.disabled = false;
+  setSendingUI(false);
+  if (!isTouch) input.focus();
 }
 
 // ---------- markdown ----------
